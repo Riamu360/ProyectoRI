@@ -1,0 +1,6 @@
+{
+  "modelo": "all-MiniLM-L6-v2",
+  "dimension": 384,
+  "n_docs": 57638,
+  "doc_ids_hash": "9fab200b8f9fe7593d03882b76d9aec1b978fc759c4de75654e6b6514cefa5ca"
+}

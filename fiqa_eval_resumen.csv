@@ -1,0 +1,5 @@
+Modelo,Consultas Evaluadas,Mean Precision@10,Mean Recall@10,MAP@100,Latencia Media (ms/query)
+Jaccard (Binario),648,0.0153,0.0625,0.0384,14.23
+TF-IDF (Coseno),648,0.0491,0.2232,0.1273,10.84
+BM25 (Probabilístico),648,0.0647,0.289,0.1791,12.51
+Embeddings (FAISS),648,0.1045,0.4413,0.3096,31.7
