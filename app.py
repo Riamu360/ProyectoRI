@@ -45,7 +45,20 @@ PROFUNDIDAD_AP = 100
 # 1. CARGA DEL CORPUS, QUERIES Y QRELS
 # ============================================================================
 def cargar_fiqa_corpus(ruta_local=RUTA_PARQUET_LOCAL, max_docs=MAX_DOCS):
-    df_corpus = pd.read_parquet(ruta_local)
+    if os.path.exists(ruta_local):
+        df_corpus = pd.read_parquet(ruta_local)
+    else:
+        print("Descargando corpus FiQA-2018 desde Hugging Face...")
+        from huggingface_hub import hf_hub_download
+        ruta_hf = hf_hub_download(
+            repo_id="BeIR/fiqa",
+            filename="corpus/corpus-00000-of-00001.parquet",
+            repo_type="dataset",
+            revision="refs/convert/parquet",
+        )
+        df_corpus = pd.read_parquet(ruta_hf)
+        df_corpus.to_parquet(ruta_local, index=False)
+
     if max_docs is not None:
         df_corpus = df_corpus.head(max_docs)
 
