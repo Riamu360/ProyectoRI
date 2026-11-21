@@ -536,4 +536,4 @@ with gr.Blocks(title="SRI FiQA-2018 — Proyecto 1er Bimestre") as demo:
 
 if __name__ == "__main__":
     puerto = int(os.environ.get("PORT", 7860))
-    demo.launch(server_name="0.0.0.0", server_port=puerto)
+    demo.launch(server_name="0.0.0.0", server_port=puerto, share=True)
