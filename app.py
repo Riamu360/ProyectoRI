@@ -44,19 +44,44 @@ PROFUNDIDAD_AP = 100
 # ============================================================================
 # 1. CARGA DEL CORPUS, QUERIES Y QRELS
 # ============================================================================
+def _descargar_tabla_hf(repo_id: str, palabras_clave: list):
+    from huggingface_hub import HfApi, hf_hub_download
+
+    api = HfApi()
+    for revision in ["refs/convert/parquet", "main"]:
+        try:
+            archivos = api.list_repo_files(repo_id=repo_id, repo_type="dataset", revision=revision)
+        except Exception:
+            continue
+
+        candidatos = [
+            f for f in archivos
+            if any(kw in f.lower() for kw in palabras_clave)
+            and f.lower().endswith((".parquet", ".jsonl", ".jsonl.gz", ".tsv"))
+        ]
+        candidatos.sort(key=lambda x: (0 if x.endswith(".parquet") else 1, x))
+        if candidatos:
+            ruta_local = hf_hub_download(
+                repo_id=repo_id,
+                filename=candidatos[0],
+                repo_type="dataset",
+                revision=revision,
+            )
+            if candidatos[0].endswith(".parquet"):
+                return pd.read_parquet(ruta_local)
+            if candidatos[0].endswith((".jsonl", ".jsonl.gz")):
+                return pd.read_json(ruta_local, lines=True)
+            return pd.read_csv(ruta_local, sep="\t")
+
+    raise FileNotFoundError(f"No se encontraron archivos ({palabras_clave}) en '{repo_id}'.")
+
+
 def cargar_fiqa_corpus(ruta_local=RUTA_PARQUET_LOCAL, max_docs=MAX_DOCS):
     if os.path.exists(ruta_local):
         df_corpus = pd.read_parquet(ruta_local)
     else:
         print("Descargando corpus FiQA-2018 desde Hugging Face...")
-        from huggingface_hub import hf_hub_download
-        ruta_hf = hf_hub_download(
-            repo_id="BeIR/fiqa",
-            filename="corpus/corpus-00000-of-00001.parquet",
-            repo_type="dataset",
-            revision="refs/convert/parquet",
-        )
-        df_corpus = pd.read_parquet(ruta_hf)
+        df_corpus = _descargar_tabla_hf("BeIR/fiqa", ["corpus"])
         df_corpus.to_parquet(ruta_local, index=False)
 
     if max_docs is not None:
