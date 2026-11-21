@@ -9,7 +9,7 @@ import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from scipy.sparse import csr_matrix, dok_matrix
+from scipy.sparse import csr_matrix
 import nltk
 from nltk.corpus import stopwords
 from nltk.tokenize import RegexpTokenizer
@@ -30,7 +30,6 @@ RUTA_FAISS_INDEX   = "fiqa_faiss.index"
 RUTA_EVAL_RESUMEN  = "fiqa_eval_resumen.csv"
 RUTA_EVAL_DETALLE  = "fiqa_eval_detalle.parquet"
 
-# 100% del corpus completo (57,638 documentos)
 MAX_DOCS = None
 MODELO_EMBEDDINGS = "all-MiniLM-L6-v2"
 TOP_K_EVAL = 10
@@ -83,12 +82,12 @@ def cargar_fiqa_corpus(ruta_local=RUTA_PARQUET_LOCAL, max_docs=MAX_DOCS):
     titulos_col = df_corpus["title"].tolist() if "title" in df_corpus.columns else [""] * len(df_corpus)
     textos_col = df_corpus["text"].tolist()
 
-    # Lista compacta en lugar de dict de strings para ahorrar RAM
     textos = []
     for titulo, cuerpo in zip(titulos_col, textos_col):
         t_str = str(titulo).strip() if pd.notna(titulo) else ""
         c_str = str(cuerpo).strip() if pd.notna(cuerpo) else ""
-        textos.append(f"{t_str} {c_str}".strip() if t_str else c_str)
+        combinado = f"{t_str} {c_str}".strip() if t_str else c_str
+        textos.append(combinado)
 
     del df_corpus, titulos_col, textos_col
     gc.collect()
@@ -135,7 +134,7 @@ def preprocesar_texto(texto: str):
 
 
 # ============================================================================
-# MOTOR CLÁSICO ULTRA-COMPACTO (CSR MATRIX INT32/FLOAT32 — SOLO ~25 MB PARA 57K DOCS)
+# MOTOR CLÁSICO DE BAJO PICO DE MEMORIA (SIN DUPLICAR MATRICES)
 # ============================================================================
 class ModelosClasicosCompactos:
     def __init__(self, doc_ids: list, textos: list):
@@ -166,23 +165,26 @@ class ModelosClasicosCompactos:
         self.longitudes_doc = longitudes_doc
         self.longitud_promedio = float(longitudes_doc.mean()) if N > 0 else 0.0
 
-        # Matriz TF por documento (CSR para acceso rápido por fila) y CSC (para postings por término)
-        self.matriz_tf_csr = csr_matrix(
-            (np.array(data_tf, dtype=np.int32), np.array(indices, dtype=np.int32), np.array(indptr, dtype=np.int32)),
-            shape=(N, V),
-        )
+        arr_data = np.array(data_tf, dtype=np.int32)
+        arr_indices = np.array(indices, dtype=np.int32)
+        arr_indptr = np.array(indptr, dtype=np.int32)
         del indices, data_tf, indptr
         gc.collect()
 
-        self.matriz_tf_csc = self.matriz_tf_csr.tocsc()
-        self.cardinalidad_doc = np.diff(self.matriz_tf_csr.indptr).astype(np.int32)
+        # Solo conservamos CSC para postings (Jaccard + BM25) y CSR para TF-IDF
+        self.matriz_tf_csc = csr_matrix((arr_data, arr_indices, arr_indptr), shape=(N, V)).tocsc()
+        self.cardinalidad_doc = np.diff(arr_indptr).astype(np.int32)
         self.df_vector = np.diff(self.matriz_tf_csc.indptr).astype(np.int32)
 
-        # Matriz TF-IDF (float32)
         self.idf_vector = np.log10((N + 1.0) / (self.df_vector + 1.0)).astype(np.float32) + np.float32(1.0)
-        matriz_tfidf = self.matriz_tf_csr.astype(np.float32, copy=True)
-        matriz_tfidf.data = (np.float32(1.0) + np.log10(matriz_tfidf.data)) * self.idf_vector[matriz_tfidf.indices]
-        self.matriz_tfidf = matriz_tfidf
+        tfidf_data = (np.float32(1.0) + np.log10(arr_data.astype(np.float32))) * self.idf_vector[arr_indices]
+        del arr_data
+        gc.collect()
+
+        self.matriz_tfidf = csr_matrix((tfidf_data, arr_indices, arr_indptr), shape=(N, V))
+        del tfidf_data, arr_indices, arr_indptr
+        gc.collect()
+
         self.normas_docs = np.sqrt(self.matriz_tfidf.multiply(self.matriz_tfidf).sum(axis=1)).A1.astype(np.float32)
         gc.collect()
 
@@ -324,9 +326,6 @@ class RecuperadorSemanticoFAISS:
             return []
 
 
-# ============================================================================
-# INICIALIZACIÓN EN SEGUNDO PLANO DE LOS 57,638 DOCUMENTOS
-# ============================================================================
 doc_ids_global = []
 textos_global = []
 doc_id_to_pos = {}
