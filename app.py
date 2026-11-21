@@ -1,10 +1,7 @@
 import os
-import re
 import gc
-import json
 import math
-import time
-import hashlib
+import threading
 from collections import defaultdict, Counter
 
 import numpy as np
@@ -12,7 +9,7 @@ import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from scipy.sparse import csr_matrix
+from scipy.sparse import csr_matrix, dok_matrix
 import nltk
 from nltk.corpus import stopwords
 from nltk.tokenize import RegexpTokenizer
@@ -30,19 +27,16 @@ RUTA_PARQUET_LOCAL = "corpus-00000-of-00001.parquet"
 RUTA_QUERIES_CACHE = "fiqa_queries.parquet"
 RUTA_QRELS_CACHE   = "fiqa_qrels_test.parquet"
 RUTA_FAISS_INDEX   = "fiqa_faiss.index"
-RUTA_FAISS_META    = "fiqa_faiss_meta.json"
 RUTA_EVAL_RESUMEN  = "fiqa_eval_resumen.csv"
 RUTA_EVAL_DETALLE  = "fiqa_eval_detalle.parquet"
 
+# 100% del corpus completo (57,638 documentos)
 MAX_DOCS = None
 MODELO_EMBEDDINGS = "all-MiniLM-L6-v2"
 TOP_K_EVAL = 10
 PROFUNDIDAD_AP = 100
 
 
-# ============================================================================
-# 1. CARGA DEL CORPUS, QUERIES Y QRELS
-# ============================================================================
 def _descargar_tabla_hf(repo_id: str, palabras_clave: list):
     from huggingface_hub import HfApi, hf_hub_download
 
@@ -79,27 +73,26 @@ def cargar_fiqa_corpus(ruta_local=RUTA_PARQUET_LOCAL, max_docs=MAX_DOCS):
     if os.path.exists(ruta_local):
         df_corpus = pd.read_parquet(ruta_local)
     else:
-        print("Descargando corpus FiQA-2018 desde Hugging Face...")
+        print("Descargando corpus FiQA-2018 completo desde Hugging Face...")
         df_corpus = _descargar_tabla_hf("BeIR/fiqa", ["corpus"])
-        df_corpus.to_parquet(ruta_local, index=False)
 
     if max_docs is not None:
         df_corpus = df_corpus.head(max_docs)
 
-    corpus_dict = {}
-    ids_col = df_corpus["_id"].tolist()
+    doc_ids = [str(x) for x in df_corpus["_id"].tolist()]
     titulos_col = df_corpus["title"].tolist() if "title" in df_corpus.columns else [""] * len(df_corpus)
     textos_col = df_corpus["text"].tolist()
 
-    for doc_id, titulo, cuerpo in zip(ids_col, titulos_col, textos_col):
-        doc_id_str = str(doc_id)
+    # Lista compacta en lugar de dict de strings para ahorrar RAM
+    textos = []
+    for titulo, cuerpo in zip(titulos_col, textos_col):
         t_str = str(titulo).strip() if pd.notna(titulo) else ""
         c_str = str(cuerpo).strip() if pd.notna(cuerpo) else ""
-        corpus_dict[doc_id_str] = f"{t_str} {c_str}".strip() if t_str else c_str
+        textos.append(f"{t_str} {c_str}".strip() if t_str else c_str)
 
-    del df_corpus, ids_col, titulos_col, textos_col
+    del df_corpus, titulos_col, textos_col
     gc.collect()
-    return corpus_dict
+    return doc_ids, textos
 
 
 def cargar_fiqa_queries_y_qrels(
@@ -142,117 +135,85 @@ def preprocesar_texto(texto: str):
 
 
 # ============================================================================
-# 2. ÍNDICE INVERTIDO PROPIO (SIN DICCIONARIO INTERMEDIO DE TOKENS)
+# MOTOR CLÁSICO ULTRA-COMPACTO (CSR MATRIX INT32/FLOAT32 — SOLO ~25 MB PARA 57K DOCS)
 # ============================================================================
-class IndiceInvertido:
-    def __init__(self):
-        self.indice = defaultdict(lambda: {"df": 0, "postings": {}})
-        self.longitudes_doc = {}
-        self.total_docs = 0
-        self.longitud_promedio = 0.0
-        self.vocabulario = []
-        self.total_postings = 0
+class ModelosClasicosCompactos:
+    def __init__(self, doc_ids: list, textos: list):
+        self.doc_ids = doc_ids
+        N = len(doc_ids)
 
-    def construir(self, corpus_textos: dict):
-        self.total_docs = len(corpus_textos)
-        suma_longitudes = 0
+        vocab_idx = {}
+        indptr = [0]
+        indices = []
+        data_tf = []
+        longitudes_doc = np.zeros(N, dtype=np.int32)
 
-        for doc_id, texto in corpus_textos.items():
+        for row_idx, texto in enumerate(textos):
             tokens = preprocesar_texto(texto)
-            dl = len(tokens)
-            self.longitudes_doc[doc_id] = dl
-            suma_longitudes += dl
+            longitudes_doc[row_idx] = len(tokens)
             conteo = Counter(tokens)
+            for term, tf in conteo.items():
+                col = vocab_idx.get(term)
+                if col is None:
+                    col = len(vocab_idx)
+                    vocab_idx[term] = col
+                indices.append(col)
+                data_tf.append(tf)
+            indptr.append(len(indices))
 
-            for termino, tf in conteo.items():
-                entrada = self.indice[termino]
-                entrada["postings"][doc_id] = tf
-                entrada["df"] += 1
-                self.total_postings += 1
+        V = len(vocab_idx)
+        self.vocab_idx = vocab_idx
+        self.longitudes_doc = longitudes_doc
+        self.longitud_promedio = float(longitudes_doc.mean()) if N > 0 else 0.0
 
-        self.longitud_promedio = suma_longitudes / self.total_docs if self.total_docs > 0 else 0.0
-        self.vocabulario = sorted(self.indice.keys())
-
-    def obtener_postings(self, termino: str):
-        entrada = self.indice.get(termino)
-        return entrada["postings"] if entrada is not None else {}
-
-    def obtener_df(self, termino: str):
-        entrada = self.indice.get(termino)
-        return entrada["df"] if entrada is not None else 0
-
-
-# ============================================================================
-# 3. MODELOS CLÁSICOS (JACCARD, TF-IDF, BM25)
-# ============================================================================
-class ModelosClasicosRI:
-    def __init__(self, indice: IndiceInvertido):
-        self.indice = indice
-        self.doc_ids = list(indice.longitudes_doc.keys())
-        self.doc_id_to_idx = {doc_id: i for i, doc_id in enumerate(self.doc_ids)}
-        self.vocab_idx = {term: i for i, term in enumerate(self.indice.vocabulario)}
-        self.cardinalidad_doc = np.zeros(len(self.doc_ids), dtype=np.int32)
-        self._construir_matriz_dispersa_tfidf()
-
-    def _construir_matriz_dispersa_tfidf(self):
-        N = self.indice.total_docs
-        V = len(self.indice.vocabulario)
-        self.idf_vector = np.zeros(V, dtype=np.float32)
-
-        if N == 0 or V == 0:
-            self.matriz_tfidf = csr_matrix((N, V), dtype=np.float32)
-            self.normas_docs = np.zeros(N, dtype=np.float32)
-            return
-
-        filas, columnas, valores = [], [], []
-        for term, col_idx in self.vocab_idx.items():
-            df = self.indice.obtener_df(term)
-            idf = math.log10((N + 1) / (df + 1)) + 1.0
-            self.idf_vector[col_idx] = idf
-
-            for doc_id, tf in self.indice.obtener_postings(term).items():
-                row_idx = self.doc_id_to_idx[doc_id]
-                self.cardinalidad_doc[row_idx] += 1
-                tf_log = 1.0 + math.log10(tf) if tf > 0 else 0.0
-                filas.append(row_idx)
-                columnas.append(col_idx)
-                valores.append(tf_log * idf)
-
-        self.matriz_tfidf = csr_matrix(
-            (np.array(valores, dtype=np.float32), (filas, columnas)),
+        # Matriz TF por documento (CSR para acceso rápido por fila) y CSC (para postings por término)
+        self.matriz_tf_csr = csr_matrix(
+            (np.array(data_tf, dtype=np.int32), np.array(indices, dtype=np.int32), np.array(indptr, dtype=np.int32)),
             shape=(N, V),
         )
-        del filas, columnas, valores
+        del indices, data_tf, indptr
         gc.collect()
-        self.normas_docs = np.sqrt(self.matriz_tfidf.multiply(self.matriz_tfidf).sum(axis=1)).A1
+
+        self.matriz_tf_csc = self.matriz_tf_csr.tocsc()
+        self.cardinalidad_doc = np.diff(self.matriz_tf_csr.indptr).astype(np.int32)
+        self.df_vector = np.diff(self.matriz_tf_csc.indptr).astype(np.int32)
+
+        # Matriz TF-IDF (float32)
+        self.idf_vector = np.log10((N + 1.0) / (self.df_vector + 1.0)).astype(np.float32) + np.float32(1.0)
+        matriz_tfidf = self.matriz_tf_csr.astype(np.float32, copy=True)
+        matriz_tfidf.data = (np.float32(1.0) + np.log10(matriz_tfidf.data)) * self.idf_vector[matriz_tfidf.indices]
+        self.matriz_tfidf = matriz_tfidf
+        self.normas_docs = np.sqrt(self.matriz_tfidf.multiply(self.matriz_tfidf).sum(axis=1)).A1.astype(np.float32)
+        gc.collect()
 
     def buscar_jaccard(self, consulta: str, top_k: int = 10):
         if top_k <= 0:
             return []
         tokens_q = set(preprocesar_texto(consulta))
+        cols = [self.vocab_idx[t] for t in tokens_q if t in self.vocab_idx]
         if not tokens_q:
             return []
 
-        intersecciones = defaultdict(int)
-        for term in tokens_q:
-            for doc_id in self.indice.obtener_postings(term):
-                intersecciones[self.doc_id_to_idx[doc_id]] += 1
+        intersecciones = np.zeros(len(self.doc_ids), dtype=np.int32)
+        for col in cols:
+            start, end = self.matriz_tf_csc.indptr[col], self.matriz_tf_csc.indptr[col + 1]
+            intersecciones[self.matriz_tf_csc.indices[start:end]] += 1
 
-        if not intersecciones:
+        candidatos = np.flatnonzero(intersecciones)
+        if len(candidatos) == 0:
             return []
 
-        len_q = len(tokens_q)
-        resultados = []
-        for row_idx, inter in intersecciones.items():
-            union = len_q + int(self.cardinalidad_doc[row_idx]) - inter
-            score = inter / union if union > 0 else 0.0
-            resultados.append((self.doc_ids[row_idx], float(score)))
+        inter_c = intersecciones[candidatos]
+        union_c = len(tokens_q) + self.cardinalidad_doc[candidatos] - inter_c
+        scores = np.where(union_c > 0, inter_c / union_c, 0.0)
 
-        resultados.sort(key=lambda x: x[1], reverse=True)
-        return [(doc_id, round(score, 4)) for doc_id, score in resultados[:top_k]]
+        k = min(top_k, len(scores))
+        top_idx = np.argpartition(-scores, k - 1)[:k]
+        top_idx = top_idx[np.argsort(-scores[top_idx])]
+        return [(self.doc_ids[candidatos[i]], round(float(scores[i]), 4)) for i in top_idx if scores[i] > 0]
 
     def buscar_tfidf_coseno(self, consulta: str, top_k: int = 10):
-        if top_k <= 0 or self.indice.total_docs == 0:
+        if top_k <= 0 or len(self.doc_ids) == 0:
             return []
         tokens_q = preprocesar_texto(consulta)
         if not tokens_q:
@@ -264,14 +225,14 @@ class ModelosClasicosRI:
             idx = self.vocab_idx.get(term)
             if idx is not None:
                 cols_q.append(idx)
-                vals_q.append((1.0 + math.log10(tf)) * self.idf_vector[idx])
+                vals_q.append((1.0 + math.log10(tf)) * float(self.idf_vector[idx]))
 
         if not cols_q:
             return []
 
         vec_q = csr_matrix(
             (np.array(vals_q, dtype=np.float32), (np.zeros(len(cols_q), dtype=int), cols_q)),
-            shape=(1, len(self.indice.vocabulario)),
+            shape=(1, len(self.vocab_idx)),
         )
         norma_q = float(np.sqrt(vec_q.multiply(vec_q).sum()))
         if norma_q == 0.0:
@@ -279,22 +240,12 @@ class ModelosClasicosRI:
 
         productos = self.matriz_tfidf.dot(vec_q.T).toarray().ravel()
         denominadores = self.normas_docs * norma_q
-        similitudes = np.divide(
-            productos,
-            denominadores,
-            out=np.zeros_like(productos),
-            where=denominadores != 0,
-        )
+        similitudes = np.divide(productos, denominadores, out=np.zeros_like(productos), where=denominadores != 0)
 
         k = min(top_k, len(similitudes))
         top_indices = np.argpartition(-similitudes, k - 1)[:k]
         top_indices = top_indices[np.argsort(-similitudes[top_indices])]
-
-        return [
-            (self.doc_ids[i], round(float(similitudes[i]), 4))
-            for i in top_indices
-            if similitudes[i] > 0
-        ]
+        return [(self.doc_ids[i], round(float(similitudes[i]), 4)) for i in top_indices if similitudes[i] > 0]
 
     def buscar_bm25(self, consulta: str, top_k: int = 10, k1: float = 1.5, b: float = 0.75):
         if top_k <= 0:
@@ -303,32 +254,38 @@ class ModelosClasicosRI:
         if not tokens_q:
             return []
 
-        N = self.indice.total_docs
-        avgdl = self.indice.longitud_promedio
+        N = len(self.doc_ids)
+        avgdl = self.longitud_promedio
         if N == 0 or avgdl == 0.0:
             return []
 
         conteo_q = Counter(tokens_q)
-        scores = defaultdict(float)
+        scores = np.zeros(N, dtype=np.float32)
 
         for term, tf_q in conteo_q.items():
-            df = self.indice.obtener_df(term)
+            col = self.vocab_idx.get(term)
+            if col is None:
+                continue
+            df = int(self.df_vector[col])
             if df == 0:
                 continue
             idf = math.log(((N - df + 0.5) / (df + 0.5)) + 1.0)
-            for doc_id, tf in self.indice.obtener_postings(term).items():
-                dl = self.indice.longitudes_doc[doc_id]
-                numerador = tf * (k1 + 1.0)
-                denominador = tf + k1 * (1.0 - b + b * (dl / avgdl))
-                scores[doc_id] += tf_q * idf * (numerador / denominador)
+            start, end = self.matriz_tf_csc.indptr[col], self.matriz_tf_csc.indptr[col + 1]
+            rows = self.matriz_tf_csc.indices[start:end]
+            tfs = self.matriz_tf_csc.data[start:end].astype(np.float32)
+            dls = self.longitudes_doc[rows].astype(np.float32)
+            scores[rows] += tf_q * idf * ((tfs * (k1 + 1.0)) / (tfs + k1 * (1.0 - b + b * (dls / avgdl))))
 
-        ranking = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-        return [(doc_id, round(float(score), 4)) for doc_id, score in ranking[:top_k]]
+        candidatos = np.flatnonzero(scores)
+        if len(candidatos) == 0:
+            return []
+        s_cand = scores[candidatos]
+        k = min(top_k, len(s_cand))
+        top_idx = np.argpartition(-s_cand, k - 1)[:k]
+        top_idx = top_idx[np.argsort(-s_cand[top_idx])]
+        return [(self.doc_ids[candidatos[i]], round(float(s_cand[i]), 4)) for i in top_idx if s_cand[i] > 0]
 
 
-# ============================================================================
-# 4. RECUPERADOR SEMÁNTICO LIGERO (FAISS EN DISCO + API HUGGING FACE)
-# ============================================================================
 class RecuperadorSemanticoFAISS:
     def __init__(self, modelo_nombre: str = MODELO_EMBEDDINGS):
         self.modelo_nombre = modelo_nombre
@@ -336,12 +293,11 @@ class RecuperadorSemanticoFAISS:
             model=f"sentence-transformers/{modelo_nombre}",
             token=os.environ.get("HF_TOKEN")
         )
-        self.dimension = 384
         self.index_faiss = None
         self.doc_ids = []
 
-    def indexar_o_cargar(self, corpus_dict: dict, ruta_indice: str = RUTA_FAISS_INDEX):
-        self.doc_ids = list(corpus_dict.keys())
+    def indexar_o_cargar(self, doc_ids: list, ruta_indice: str = RUTA_FAISS_INDEX):
+        self.doc_ids = doc_ids
         self.index_faiss = faiss.read_index(ruta_indice, faiss.IO_FLAG_MMAP)
         print(f"Índice FAISS cargado (mmap): {self.index_faiss.ntotal:,} vectores.")
 
@@ -361,7 +317,7 @@ class RecuperadorSemanticoFAISS:
             return [
                 (self.doc_ids[idx], round(float(score), 4))
                 for score, idx in zip(distancias[0], indices[0])
-                if idx != -1 and score > 0
+                if 0 <= idx < len(self.doc_ids) and score > 0
             ]
         except Exception as e:
             print(f"Error consultando API de embeddings: {e}")
@@ -369,28 +325,55 @@ class RecuperadorSemanticoFAISS:
 
 
 # ============================================================================
-# 5. INICIALIZACIÓN DE MOTORES CON LIBERACIÓN DE MEMORIA
+# INICIALIZACIÓN EN SEGUNDO PLANO DE LOS 57,638 DOCUMENTOS
 # ============================================================================
-print("Iniciando carga del SRI FiQA-2018...")
-corpus = cargar_fiqa_corpus()
-queries_test, qrels_test = cargar_fiqa_queries_y_qrels(set(corpus.keys()))
-
-indice_invertido = IndiceInvertido()
-indice_invertido.construir(corpus)
-gc.collect()
-
-motor_clasico = ModelosClasicosRI(indice_invertido)
-gc.collect()
-
-motor_semantico = RecuperadorSemanticoFAISS(MODELO_EMBEDDINGS)
-motor_semantico.indexar_o_cargar(corpus)
-gc.collect()
-print("Motores listos.")
+doc_ids_global = []
+textos_global = []
+doc_id_to_pos = {}
+queries_test = {}
+qrels_test = {}
+motor_clasico = None
+motor_semantico = None
+estado_carga = {"listo": False, "mensaje": "Indexando los 57,638 documentos en segundo plano (espera ~25s)..."}
 
 
-# ============================================================================
-# 6. GRÁFICOS E INTERFAZ WEB GRADIO
-# ============================================================================
+def _inicializar_motores_bg():
+    global doc_ids_global, textos_global, doc_id_to_pos, queries_test, qrels_test, motor_clasico, motor_semantico
+    try:
+        ids, txts = cargar_fiqa_corpus()
+        id_map = {d: i for i, d in enumerate(ids)}
+        qt, qr = cargar_fiqa_queries_y_qrels(set(ids))
+
+        mc = ModelosClasicosCompactos(ids, txts)
+        gc.collect()
+
+        ms = RecuperadorSemanticoFAISS(MODELO_EMBEDDINGS)
+        ms.indexar_o_cargar(ids)
+        gc.collect()
+
+        doc_ids_global = ids
+        textos_global = txts
+        doc_id_to_pos = id_map
+        queries_test = qt
+        qrels_test = qr
+        motor_clasico = mc
+        motor_semantico = ms
+        estado_carga["listo"] = True
+        estado_carga["mensaje"] = f"Sistema listo: {len(doc_ids_global):,} documentos completos indexados."
+        print(estado_carga["mensaje"])
+    except Exception as e:
+        estado_carga["mensaje"] = f"Error cargando motores: {e}"
+        print(estado_carga["mensaje"])
+
+
+threading.Thread(target=_inicializar_motores_bg, daemon=True).start()
+
+
+def _obtener_texto(doc_id: str) -> str:
+    pos = doc_id_to_pos.get(doc_id)
+    return textos_global[pos] if pos is not None else ""
+
+
 def graficar_metricas_modelos(df_resumen: pd.DataFrame, k: int = TOP_K_EVAL, profundidad_ap: int = PROFUNDIDAD_AP):
     fig, axes = plt.subplots(1, 2, figsize=(13, 4.8))
     modelos = df_resumen["Modelo"].tolist()
@@ -434,6 +417,8 @@ def _buscar_qrels_por_texto(consulta: str):
 
 def ejecutar_busqueda_web(consulta: str, modelo_elegido: str, top_n: int):
     cols_ind = ["Rank", "Doc ID (FiQA)", "Relevante (qrels)", "Score", "Contenido Completo del Documento"]
+    if not estado_carga["listo"]:
+        return pd.DataFrame(columns=cols_ind), pd.DataFrame(), estado_carga["mensaje"]
     if not consulta or not consulta.strip():
         return pd.DataFrame(columns=cols_ind), pd.DataFrame(), "Ingresa una consulta para buscar."
 
@@ -455,7 +440,7 @@ def ejecutar_busqueda_web(consulta: str, modelo_elegido: str, top_n: int):
             "Doc ID (FiQA)": doc_id,
             "Relevante (qrels)": "SÍ [REL]" if doc_id in relevantes else ("No" if relevantes else "-"),
             "Score": score,
-            "Contenido Completo del Documento": corpus.get(doc_id, ""),
+            "Contenido Completo del Documento": _obtener_texto(doc_id),
         }
         for i, (doc_id, score) in enumerate(res_sel)
     ]
@@ -465,7 +450,7 @@ def ejecutar_busqueda_web(consulta: str, modelo_elegido: str, top_n: int):
         salida = []
         for d, s in lista:
             marca = " [REL]" if d in relevantes else ""
-            snippet = corpus.get(d, "")[:95].replace("\n", " ")
+            snippet = _obtener_texto(d)[:95].replace("\n", " ")
             salida.append(f"ID:{d}{marca} ({s}) — {snippet}...")
         while len(salida) < top_n:
             salida.append("-")
@@ -482,7 +467,7 @@ def ejecutar_busqueda_web(consulta: str, modelo_elegido: str, top_n: int):
     if q_id_match:
         estado = f"Consulta detectada en Test Set (`query_id={q_id_match}`, {len(relevantes)} relevantes en qrels)."
     else:
-        estado = f"Consulta libre ejecutada sobre {len(corpus):,} documentos."
+        estado = f"Consulta libre ejecutada sobre los {len(doc_ids_global):,} documentos completos."
 
     return df_individual, df_comp, estado
 
@@ -495,15 +480,12 @@ ejemplos_ui = [
     ["How can I improve my credit score quickly without paying fees?"],
     ["What is the difference between an index fund and an ETF?"],
 ]
-if queries_test:
-    primeras_test = list(queries_test.values())[:3]
-    ejemplos_ui = [[q] for q in primeras_test] + ejemplos_ui[:1]
 
 with gr.Blocks(title="SRI FiQA-2018 — Proyecto 1er Bimestre") as demo:
     gr.Markdown("# Sistema de Recuperación de Información — Corpus FiQA-2018 (BeIR)")
     gr.Markdown(
         f"Comparación de modelos clásicos (Jaccard, TF-IDF, BM25) y recuperación semántica "
-        f"(`{MODELO_EMBEDDINGS}` + FAISS) sobre **{len(corpus):,}** documentos financieros."
+        f"(`{MODELO_EMBEDDINGS}` + FAISS) sobre los **57,638** documentos completos."
     )
 
     with gr.Tab("1. Búsqueda y Comparación de Modelos"):
