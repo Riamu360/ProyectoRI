@@ -1,7 +1,6 @@
 import os
 import gc
 import math
-import threading
 from collections import defaultdict, Counter
 
 import numpy as np
@@ -30,7 +29,8 @@ RUTA_FAISS_INDEX   = "fiqa_faiss.index"
 RUTA_EVAL_RESUMEN  = "fiqa_eval_resumen.csv"
 RUTA_EVAL_DETALLE  = "fiqa_eval_detalle.parquet"
 
-MAX_DOCS = None
+# Muestra de 12,000 documentos para Render Free (512 MB RAM)
+MAX_DOCS = 12000
 MODELO_EMBEDDINGS = "all-MiniLM-L6-v2"
 TOP_K_EVAL = 10
 PROFUNDIDAD_AP = 100
@@ -72,44 +72,36 @@ def cargar_fiqa_corpus(ruta_local=RUTA_PARQUET_LOCAL, max_docs=MAX_DOCS):
     if os.path.exists(ruta_local):
         df_corpus = pd.read_parquet(ruta_local)
     else:
-        print("Descargando corpus FiQA-2018 completo desde Hugging Face...")
+        print("Descargando muestra del corpus FiQA-2018 desde Hugging Face...")
         df_corpus = _descargar_tabla_hf("BeIR/fiqa", ["corpus"])
 
     if max_docs is not None:
         df_corpus = df_corpus.head(max_docs)
 
-    doc_ids = [str(x) for x in df_corpus["_id"].tolist()]
+    corpus_dict = {}
+    ids_col = df_corpus["_id"].tolist()
     titulos_col = df_corpus["title"].tolist() if "title" in df_corpus.columns else [""] * len(df_corpus)
     textos_col = df_corpus["text"].tolist()
 
-    textos = []
-    for titulo, cuerpo in zip(titulos_col, textos_col):
+    for doc_id, titulo, cuerpo in zip(ids_col, titulos_col, textos_col):
+        doc_id_str = str(doc_id)
         t_str = str(titulo).strip() if pd.notna(titulo) else ""
         c_str = str(cuerpo).strip() if pd.notna(cuerpo) else ""
-        combinado = f"{t_str} {c_str}".strip() if t_str else c_str
-        textos.append(combinado)
+        corpus_dict[doc_id_str] = f"{t_str} {c_str}".strip() if t_str else c_str
 
-    del df_corpus, titulos_col, textos_col
+    del df_corpus, ids_col, titulos_col, textos_col
     gc.collect()
-    return doc_ids, textos
+    return corpus_dict
 
 
-def cargar_fiqa_queries_y_qrels(
-    corpus_ids_validos: set,
-    ruta_queries_cache: str = RUTA_QUERIES_CACHE,
-    ruta_qrels_cache: str = RUTA_QRELS_CACHE,
-):
-    if not (os.path.exists(ruta_queries_cache) and os.path.exists(ruta_qrels_cache)):
+def cargar_fiqa_queries_y_qrels(corpus_ids_validos: set):
+    if not (os.path.exists(RUTA_QUERIES_CACHE) and os.path.exists(RUTA_QRELS_CACHE)):
         return {}, {}
 
-    df_queries = pd.read_parquet(ruta_queries_cache)
-    df_qrels = pd.read_parquet(ruta_qrels_cache)
+    df_queries = pd.read_parquet(RUTA_QUERIES_CACHE)
+    df_qrels = pd.read_parquet(RUTA_QRELS_CACHE)
 
-    todas_queries = {
-        str(qid): str(txt)
-        for qid, txt in zip(df_queries["_id"], df_queries["text"])
-    }
-
+    todas_queries = {str(qid): str(txt) for qid, txt in zip(df_queries["_id"], df_queries["text"])}
     qrels_dict = defaultdict(set)
     for q_id, d_id, score in zip(df_qrels["query-id"], df_qrels["corpus-id"], df_qrels["score"]):
         q_str, d_str = str(q_id), str(d_id)
@@ -133,178 +125,141 @@ def preprocesar_texto(texto: str):
     return [t for t in tokens if len(t) > 1 and t not in STOPWORDS_EN]
 
 
-# ============================================================================
-# MOTOR CLÁSICO DE BAJO PICO DE MEMORIA (SIN DUPLICAR MATRICES)
-# ============================================================================
-class ModelosClasicosCompactos:
-    def __init__(self, doc_ids: list, textos: list):
-        self.doc_ids = doc_ids
-        N = len(doc_ids)
+class IndiceInvertido:
+    def __init__(self):
+        self.indice = defaultdict(lambda: {"df": 0, "postings": {}})
+        self.longitudes_doc = {}
+        self.total_docs = 0
+        self.longitud_promedio = 0.0
+        self.vocabulario = []
 
-        vocab_idx = {}
-        indptr = [0]
-        indices = []
-        data_tf = []
-        longitudes_doc = np.zeros(N, dtype=np.int32)
+    def construir(self, corpus_textos: dict):
+        self.total_docs = len(corpus_textos)
+        suma_longitudes = 0
 
-        for row_idx, texto in enumerate(textos):
+        for doc_id, texto in corpus_textos.items():
             tokens = preprocesar_texto(texto)
-            longitudes_doc[row_idx] = len(tokens)
-            conteo = Counter(tokens)
-            for term, tf in conteo.items():
-                col = vocab_idx.get(term)
-                if col is None:
-                    col = len(vocab_idx)
-                    vocab_idx[term] = col
-                indices.append(col)
-                data_tf.append(tf)
-            indptr.append(len(indices))
+            dl = len(tokens)
+            self.longitudes_doc[doc_id] = dl
+            suma_longitudes += dl
+            for termino, tf in Counter(tokens).items():
+                entrada = self.indice[termino]
+                entrada["postings"][doc_id] = tf
+                entrada["df"] += 1
 
-        V = len(vocab_idx)
-        self.vocab_idx = vocab_idx
-        self.longitudes_doc = longitudes_doc
-        self.longitud_promedio = float(longitudes_doc.mean()) if N > 0 else 0.0
+        self.longitud_promedio = suma_longitudes / self.total_docs if self.total_docs > 0 else 0.0
+        self.vocabulario = sorted(self.indice.keys())
 
-        arr_data = np.array(data_tf, dtype=np.int32)
-        arr_indices = np.array(indices, dtype=np.int32)
-        arr_indptr = np.array(indptr, dtype=np.int32)
-        del indices, data_tf, indptr
+    def obtener_postings(self, termino: str):
+        entrada = self.indice.get(termino)
+        return entrada["postings"] if entrada is not None else {}
+
+    def obtener_df(self, termino: str):
+        entrada = self.indice.get(termino)
+        return entrada["df"] if entrada is not None else 0
+
+
+class ModelosClasicosRI:
+    def __init__(self, indice: IndiceInvertido):
+        self.indice = indice
+        self.doc_ids = list(indice.longitudes_doc.keys())
+        self.doc_id_to_idx = {doc_id: i for i, doc_id in enumerate(self.doc_ids)}
+        self.vocab_idx = {term: i for i, term in enumerate(self.indice.vocabulario)}
+        self.cardinalidad_doc = np.zeros(len(self.doc_ids), dtype=np.int32)
+        self._construir_matriz_dispersa_tfidf()
+
+    def _construir_matriz_dispersa_tfidf(self):
+        N = self.indice.total_docs
+        V = len(self.indice.vocabulario)
+        self.idf_vector = np.zeros(V, dtype=np.float32)
+
+        filas, columnas, valores = [], [], []
+        for term, col_idx in self.vocab_idx.items():
+            df = self.indice.obtener_df(term)
+            idf = math.log10((N + 1) / (df + 1)) + 1.0
+            self.idf_vector[col_idx] = idf
+            for doc_id, tf in self.indice.obtener_postings(term).items():
+                row_idx = self.doc_id_to_idx[doc_id]
+                self.cardinalidad_doc[row_idx] += 1
+                filas.append(row_idx)
+                columnas.append(col_idx)
+                valores.append((1.0 + math.log10(tf)) * idf)
+
+        self.matriz_tfidf = csr_matrix((np.array(valores, dtype=np.float32), (filas, columnas)), shape=(N, V))
+        del filas, columnas, valores
         gc.collect()
-
-        # Solo conservamos CSC para postings (Jaccard + BM25) y CSR para TF-IDF
-        self.matriz_tf_csc = csr_matrix((arr_data, arr_indices, arr_indptr), shape=(N, V)).tocsc()
-        self.cardinalidad_doc = np.diff(arr_indptr).astype(np.int32)
-        self.df_vector = np.diff(self.matriz_tf_csc.indptr).astype(np.int32)
-
-        self.idf_vector = np.log10((N + 1.0) / (self.df_vector + 1.0)).astype(np.float32) + np.float32(1.0)
-        tfidf_data = (np.float32(1.0) + np.log10(arr_data.astype(np.float32))) * self.idf_vector[arr_indices]
-        del arr_data
-        gc.collect()
-
-        self.matriz_tfidf = csr_matrix((tfidf_data, arr_indices, arr_indptr), shape=(N, V))
-        del tfidf_data, arr_indices, arr_indptr
-        gc.collect()
-
-        self.normas_docs = np.sqrt(self.matriz_tfidf.multiply(self.matriz_tfidf).sum(axis=1)).A1.astype(np.float32)
-        gc.collect()
+        self.normas_docs = np.sqrt(self.matriz_tfidf.multiply(self.matriz_tfidf).sum(axis=1)).A1
 
     def buscar_jaccard(self, consulta: str, top_k: int = 10):
-        if top_k <= 0:
-            return []
         tokens_q = set(preprocesar_texto(consulta))
-        cols = [self.vocab_idx[t] for t in tokens_q if t in self.vocab_idx]
         if not tokens_q:
             return []
-
-        intersecciones = np.zeros(len(self.doc_ids), dtype=np.int32)
-        for col in cols:
-            start, end = self.matriz_tf_csc.indptr[col], self.matriz_tf_csc.indptr[col + 1]
-            intersecciones[self.matriz_tf_csc.indices[start:end]] += 1
-
-        candidatos = np.flatnonzero(intersecciones)
-        if len(candidatos) == 0:
-            return []
-
-        inter_c = intersecciones[candidatos]
-        union_c = len(tokens_q) + self.cardinalidad_doc[candidatos] - inter_c
-        scores = np.where(union_c > 0, inter_c / union_c, 0.0)
-
-        k = min(top_k, len(scores))
-        top_idx = np.argpartition(-scores, k - 1)[:k]
-        top_idx = top_idx[np.argsort(-scores[top_idx])]
-        return [(self.doc_ids[candidatos[i]], round(float(scores[i]), 4)) for i in top_idx if scores[i] > 0]
+        intersecciones = defaultdict(int)
+        for term in tokens_q:
+            for doc_id in self.indice.obtener_postings(term):
+                intersecciones[self.doc_id_to_idx[doc_id]] += 1
+        len_q = len(tokens_q)
+        resultados = [
+            (self.doc_ids[r], inter / (len_q + int(self.cardinalidad_doc[r]) - inter))
+            for r, inter in intersecciones.items()
+            if (len_q + int(self.cardinalidad_doc[r]) - inter) > 0
+        ]
+        resultados.sort(key=lambda x: x[1], reverse=True)
+        return [(d, round(float(s), 4)) for d, s in resultados[:top_k]]
 
     def buscar_tfidf_coseno(self, consulta: str, top_k: int = 10):
-        if top_k <= 0 or len(self.doc_ids) == 0:
-            return []
         tokens_q = preprocesar_texto(consulta)
         if not tokens_q:
             return []
-
         conteo_q = Counter(tokens_q)
         cols_q, vals_q = [], []
         for term, tf in conteo_q.items():
             idx = self.vocab_idx.get(term)
             if idx is not None:
                 cols_q.append(idx)
-                vals_q.append((1.0 + math.log10(tf)) * float(self.idf_vector[idx]))
-
+                vals_q.append((1.0 + math.log10(tf)) * self.idf_vector[idx])
         if not cols_q:
             return []
-
-        vec_q = csr_matrix(
-            (np.array(vals_q, dtype=np.float32), (np.zeros(len(cols_q), dtype=int), cols_q)),
-            shape=(1, len(self.vocab_idx)),
-        )
+        vec_q = csr_matrix((np.array(vals_q, dtype=np.float32), (np.zeros(len(cols_q), dtype=int), cols_q)), shape=(1, len(self.indice.vocabulario)))
         norma_q = float(np.sqrt(vec_q.multiply(vec_q).sum()))
         if norma_q == 0.0:
             return []
-
         productos = self.matriz_tfidf.dot(vec_q.T).toarray().ravel()
         denominadores = self.normas_docs * norma_q
         similitudes = np.divide(productos, denominadores, out=np.zeros_like(productos), where=denominadores != 0)
-
         k = min(top_k, len(similitudes))
         top_indices = np.argpartition(-similitudes, k - 1)[:k]
         top_indices = top_indices[np.argsort(-similitudes[top_indices])]
         return [(self.doc_ids[i], round(float(similitudes[i]), 4)) for i in top_indices if similitudes[i] > 0]
 
     def buscar_bm25(self, consulta: str, top_k: int = 10, k1: float = 1.5, b: float = 0.75):
-        if top_k <= 0:
-            return []
         tokens_q = preprocesar_texto(consulta)
         if not tokens_q:
             return []
-
-        N = len(self.doc_ids)
-        avgdl = self.longitud_promedio
-        if N == 0 or avgdl == 0.0:
-            return []
-
+        N = self.indice.total_docs
+        avgdl = self.indice.longitud_promedio
         conteo_q = Counter(tokens_q)
-        scores = np.zeros(N, dtype=np.float32)
-
+        scores = defaultdict(float)
         for term, tf_q in conteo_q.items():
-            col = self.vocab_idx.get(term)
-            if col is None:
-                continue
-            df = int(self.df_vector[col])
+            df = self.indice.obtener_df(term)
             if df == 0:
                 continue
             idf = math.log(((N - df + 0.5) / (df + 0.5)) + 1.0)
-            start, end = self.matriz_tf_csc.indptr[col], self.matriz_tf_csc.indptr[col + 1]
-            rows = self.matriz_tf_csc.indices[start:end]
-            tfs = self.matriz_tf_csc.data[start:end].astype(np.float32)
-            dls = self.longitudes_doc[rows].astype(np.float32)
-            scores[rows] += tf_q * idf * ((tfs * (k1 + 1.0)) / (tfs + k1 * (1.0 - b + b * (dls / avgdl))))
-
-        candidatos = np.flatnonzero(scores)
-        if len(candidatos) == 0:
-            return []
-        s_cand = scores[candidatos]
-        k = min(top_k, len(s_cand))
-        top_idx = np.argpartition(-s_cand, k - 1)[:k]
-        top_idx = top_idx[np.argsort(-s_cand[top_idx])]
-        return [(self.doc_ids[candidatos[i]], round(float(s_cand[i]), 4)) for i in top_idx if s_cand[i] > 0]
+            for doc_id, tf in self.indice.obtener_postings(term).items():
+                dl = self.indice.longitudes_doc[doc_id]
+                scores[doc_id] += tf_q * idf * ((tf * (k1 + 1.0)) / (tf + k1 * (1.0 - b + b * (dl / avgdl))))
+        ranking = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+        return [(d, round(float(s), 4)) for d, s in ranking[:top_k]]
 
 
 class RecuperadorSemanticoFAISS:
-    def __init__(self, modelo_nombre: str = MODELO_EMBEDDINGS):
-        self.modelo_nombre = modelo_nombre
-        self.client = InferenceClient(
-            model=f"sentence-transformers/{modelo_nombre}",
-            token=os.environ.get("HF_TOKEN")
-        )
-        self.index_faiss = None
-        self.doc_ids = []
-
-    def indexar_o_cargar(self, doc_ids: list, ruta_indice: str = RUTA_FAISS_INDEX):
-        self.doc_ids = doc_ids
-        self.index_faiss = faiss.read_index(ruta_indice, faiss.IO_FLAG_MMAP)
-        print(f"Índice FAISS cargado (mmap): {self.index_faiss.ntotal:,} vectores.")
+    def __init__(self, doc_ids_muestra: list):
+        self.client = InferenceClient(model=f"sentence-transformers/{MODELO_EMBEDDINGS}", token=os.environ.get("HF_TOKEN"))
+        self.doc_ids = doc_ids_muestra
+        self.index_faiss = faiss.read_index(RUTA_FAISS_INDEX, faiss.IO_FLAG_MMAP)
 
     def buscar(self, consulta: str, top_k: int = 10):
-        if top_k <= 0 or not consulta or not consulta.strip() or self.index_faiss is None:
+        if top_k <= 0 or not consulta or not consulta.strip():
             return []
         try:
             emb_q = np.array(self.client.feature_extraction(consulta), dtype="float32")
@@ -314,63 +269,35 @@ class RecuperadorSemanticoFAISS:
                 emb_q = emb_q.mean(axis=1)
             faiss.normalize_L2(emb_q)
 
-            k = min(top_k, len(self.doc_ids))
-            distancias, indices = self.index_faiss.search(emb_q, k)
-            return [
-                (self.doc_ids[idx], round(float(score), 4))
-                for score, idx in zip(distancias[0], indices[0])
-                if 0 <= idx < len(self.doc_ids) and score > 0
-            ]
+            k_busqueda = min(max(top_k * 8, 80), self.index_faiss.ntotal)
+            distancias, indices = self.index_faiss.search(emb_q, k_busqueda)
+            resultados = []
+            n_muestra = len(self.doc_ids)
+            for score, idx in zip(distancias[0], indices[0]):
+                if 0 <= idx < n_muestra and score > 0:
+                    resultados.append((self.doc_ids[idx], round(float(score), 4)))
+                    if len(resultados) >= top_k:
+                        break
+            return resultados
         except Exception as e:
-            print(f"Error consultando API de embeddings: {e}")
+            print(f"Error API embeddings: {e}")
             return []
 
 
-doc_ids_global = []
-textos_global = []
-doc_id_to_pos = {}
-queries_test = {}
-qrels_test = {}
-motor_clasico = None
-motor_semantico = None
-estado_carga = {"listo": False, "mensaje": "Indexando los 57,638 documentos en segundo plano (espera ~25s)..."}
+# Carga directa y ligera de la muestra (12,000 docs)
+print("Cargando muestra de FiQA-2018...")
+corpus = cargar_fiqa_corpus()
+doc_ids = list(corpus.keys())
+queries_test, qrels_test = cargar_fiqa_queries_y_qrels(set(doc_ids))
 
+indice_invertido = IndiceInvertido()
+indice_invertido.construir(corpus)
+gc.collect()
 
-def _inicializar_motores_bg():
-    global doc_ids_global, textos_global, doc_id_to_pos, queries_test, qrels_test, motor_clasico, motor_semantico
-    try:
-        ids, txts = cargar_fiqa_corpus()
-        id_map = {d: i for i, d in enumerate(ids)}
-        qt, qr = cargar_fiqa_queries_y_qrels(set(ids))
-
-        mc = ModelosClasicosCompactos(ids, txts)
-        gc.collect()
-
-        ms = RecuperadorSemanticoFAISS(MODELO_EMBEDDINGS)
-        ms.indexar_o_cargar(ids)
-        gc.collect()
-
-        doc_ids_global = ids
-        textos_global = txts
-        doc_id_to_pos = id_map
-        queries_test = qt
-        qrels_test = qr
-        motor_clasico = mc
-        motor_semantico = ms
-        estado_carga["listo"] = True
-        estado_carga["mensaje"] = f"Sistema listo: {len(doc_ids_global):,} documentos completos indexados."
-        print(estado_carga["mensaje"])
-    except Exception as e:
-        estado_carga["mensaje"] = f"Error cargando motores: {e}"
-        print(estado_carga["mensaje"])
-
-
-threading.Thread(target=_inicializar_motores_bg, daemon=True).start()
-
-
-def _obtener_texto(doc_id: str) -> str:
-    pos = doc_id_to_pos.get(doc_id)
-    return textos_global[pos] if pos is not None else ""
+motor_clasico = ModelosClasicosRI(indice_invertido)
+motor_semantico = RecuperadorSemanticoFAISS(doc_ids)
+gc.collect()
+print(f"SRI listo con muestra de {len(corpus):,} documentos.")
 
 
 def graficar_metricas_modelos(df_resumen: pd.DataFrame, k: int = TOP_K_EVAL, profundidad_ap: int = PROFUNDIDAD_AP):
@@ -378,9 +305,8 @@ def graficar_metricas_modelos(df_resumen: pd.DataFrame, k: int = TOP_K_EVAL, pro
     modelos = df_resumen["Modelo"].tolist()
     x = np.arange(len(modelos))
     ancho = 0.25
-
     axes[0].bar(x - ancho, df_resumen[f"Mean Precision@{k}"], width=ancho, label=f"Precision@{k}", color="#4C78A8")
-    axes[0].bar(x,         df_resumen[f"Mean Recall@{k}"], width=ancho, label=f"Recall@{k}", color="#F58518")
+    axes[0].bar(x, df_resumen[f"Mean Recall@{k}"], width=ancho, label=f"Recall@{k}", color="#F58518")
     axes[0].bar(x + ancho, df_resumen[f"MAP@{profundidad_ap}"], width=ancho, label=f"MAP@{profundidad_ap}", color="#54A24B")
     axes[0].set_xticks(x)
     axes[0].set_xticklabels(modelos, rotation=15, ha="right")
@@ -388,22 +314,14 @@ def graficar_metricas_modelos(df_resumen: pd.DataFrame, k: int = TOP_K_EVAL, pro
     axes[0].set_title("Comparación de Calidad de Recuperación (FiQA-2018)")
     axes[0].grid(axis="y", linestyle="--", alpha=0.4)
     axes[0].legend()
-
     axes[1].bar(modelos, df_resumen["Latencia Media (ms/query)"], color="#E45756")
     axes[1].set_xticks(x)
     axes[1].set_xticklabels(modelos, rotation=15, ha="right")
     axes[1].set_ylabel("Milisegundos por consulta")
     axes[1].set_title("Latencia Media de Búsqueda por Modelo")
     axes[1].grid(axis="y", linestyle="--", alpha=0.4)
-
     plt.tight_layout()
     return fig
-
-
-def _cargar_metricas_seguro():
-    res = pd.read_csv(RUTA_EVAL_RESUMEN) if os.path.exists(RUTA_EVAL_RESUMEN) else pd.DataFrame()
-    det = pd.read_parquet(RUTA_EVAL_DETALLE) if os.path.exists(RUTA_EVAL_DETALLE) else pd.DataFrame()
-    return res, det
 
 
 def _buscar_qrels_por_texto(consulta: str):
@@ -416,11 +334,8 @@ def _buscar_qrels_por_texto(consulta: str):
 
 def ejecutar_busqueda_web(consulta: str, modelo_elegido: str, top_n: int):
     cols_ind = ["Rank", "Doc ID (FiQA)", "Relevante (qrels)", "Score", "Contenido Completo del Documento"]
-    if not estado_carga["listo"]:
-        return pd.DataFrame(columns=cols_ind), pd.DataFrame(), estado_carga["mensaje"]
     if not consulta or not consulta.strip():
         return pd.DataFrame(columns=cols_ind), pd.DataFrame(), "Ingresa una consulta para buscar."
-
     top_n = int(top_n)
     q_id_match, relevantes = _buscar_qrels_por_texto(consulta)
 
@@ -439,7 +354,7 @@ def ejecutar_busqueda_web(consulta: str, modelo_elegido: str, top_n: int):
             "Doc ID (FiQA)": doc_id,
             "Relevante (qrels)": "SÍ [REL]" if doc_id in relevantes else ("No" if relevantes else "-"),
             "Score": score,
-            "Contenido Completo del Documento": _obtener_texto(doc_id),
+            "Contenido Completo del Documento": corpus.get(doc_id, ""),
         }
         for i, (doc_id, score) in enumerate(res_sel)
     ]
@@ -449,7 +364,7 @@ def ejecutar_busqueda_web(consulta: str, modelo_elegido: str, top_n: int):
         salida = []
         for d, s in lista:
             marca = " [REL]" if d in relevantes else ""
-            snippet = _obtener_texto(d)[:95].replace("\n", " ")
+            snippet = corpus.get(d, "")[:95].replace("\n", " ")
             salida.append(f"ID:{d}{marca} ({s}) — {snippet}...")
         while len(salida) < top_n:
             salida.append("-")
@@ -463,15 +378,15 @@ def ejecutar_busqueda_web(consulta: str, modelo_elegido: str, top_n: int):
         "Embeddings (FAISS)": fmt_celdas(motor_semantico.buscar(consulta, top_k=top_n)),
     })
 
-    if q_id_match:
-        estado = f"Consulta detectada en Test Set (`query_id={q_id_match}`, {len(relevantes)} relevantes en qrels)."
-    else:
-        estado = f"Consulta libre ejecutada sobre los {len(doc_ids_global):,} documentos completos."
-
+    estado = (
+        f"Consulta detectada en Test Set (`query_id={q_id_match}`, {len(relevantes)} relevantes en qrels)."
+        if q_id_match else f"Consulta libre ejecutada sobre muestra de {len(corpus):,} documentos."
+    )
     return df_individual, df_comp, estado
 
 
-df_resumen_ui, df_detalle_ui = _cargar_metricas_seguro()
+df_resumen_ui = pd.read_csv(RUTA_EVAL_RESUMEN) if os.path.exists(RUTA_EVAL_RESUMEN) else pd.DataFrame()
+df_detalle_ui = pd.read_parquet(RUTA_EVAL_DETALLE) if os.path.exists(RUTA_EVAL_DETALLE) else pd.DataFrame()
 n_eval_ui = int(df_resumen_ui["Consultas Evaluadas"].iloc[0]) if not df_resumen_ui.empty else 0
 
 ejemplos_ui = [
@@ -482,57 +397,32 @@ ejemplos_ui = [
 
 with gr.Blocks(title="SRI FiQA-2018 — Proyecto 1er Bimestre") as demo:
     gr.Markdown("# Sistema de Recuperación de Información — Corpus FiQA-2018 (BeIR)")
-    gr.Markdown(
-        f"Comparación de modelos clásicos (Jaccard, TF-IDF, BM25) y recuperación semántica "
-        f"(`{MODELO_EMBEDDINGS}` + FAISS) sobre los **57,638** documentos completos."
-    )
+    gr.Markdown(f"Comparación de modelos clásicos y recuperación semántica sobre muestra de **{len(corpus):,}** documentos (evaluación oficial sobre 57,638 documentos).")
 
     with gr.Tab("1. Búsqueda y Comparación de Modelos"):
         with gr.Row():
-            txt_consulta = gr.Textbox(
-                label="Consulta financiera en texto libre",
-                placeholder="Ej: Should I invest in a Roth IRA or traditional 401k for retirement?",
-                scale=3,
-            )
+            txt_consulta = gr.Textbox(label="Consulta financiera en texto libre", placeholder="Ej: Should I invest in a Roth IRA or traditional 401k for retirement?", scale=3)
             dd_modelo = gr.Dropdown(
-                choices=[
-                    "Binario (Jaccard)",
-                    "Vectorial (TF-IDF + Coseno)",
-                    "Probabilístico (BM25)",
-                    "Vectorial Semántico (Embeddings + FAISS)",
-                ],
-                value="Vectorial Semántico (Embeddings + FAISS)",
-                label="Modelo Principal",
-                scale=2,
+                choices=["Binario (Jaccard)", "Vectorial (TF-IDF + Coseno)", "Probabilístico (BM25)", "Vectorial Semántico (Embeddings + FAISS)"],
+                value="Vectorial Semántico (Embeddings + FAISS)", label="Modelo Principal", scale=2
             )
             sld_topn = gr.Slider(minimum=1, maximum=15, value=5, step=1, label="Top-N", scale=1)
-
         btn_buscar = gr.Button("Ejecutar Búsqueda", variant="primary")
         lbl_estado = gr.Markdown("")
-
         gr.Examples(examples=ejemplos_ui, inputs=[txt_consulta], label="Ejemplos rápidos (clic para probar)")
-
         gr.Markdown("### Ranking del Modelo Seleccionado")
         out_individual = gr.Dataframe(interactive=False, wrap=True)
-
         gr.Markdown("### Comparación Lado a Lado entre los 4 Modelos")
         out_comparacion = gr.Dataframe(interactive=False, wrap=True)
-
-        btn_buscar.click(
-            fn=ejecutar_busqueda_web,
-            inputs=[txt_consulta, dd_modelo, sld_topn],
-            outputs=[out_individual, out_comparacion, lbl_estado],
-        )
+        btn_buscar.click(fn=ejecutar_busqueda_web, inputs=[txt_consulta, dd_modelo, sld_topn], outputs=[out_individual, out_comparacion, lbl_estado])
 
     with gr.Tab("2. Evaluación Oficial (Precision, Recall, MAP)"):
         if not df_resumen_ui.empty:
-            gr.Markdown(f"### Resumen Global de Métricas en FiQA-2018 ({n_eval_ui:,} consultas evaluadas)")
+            gr.Markdown(f"### Resumen Global de Métricas en FiQA-2018 ({n_eval_ui:,} consultas evaluadas sobre el corpus completo)")
             gr.Dataframe(value=df_resumen_ui, interactive=False)
             gr.Plot(value=graficar_metricas_modelos(df_resumen_ui), label="Gráfico Comparativo")
             gr.Markdown("### Desglose por Consulta (Muestra de 100 filas)")
             gr.Dataframe(value=df_detalle_ui.head(100), interactive=False)
-        else:
-            gr.Markdown("**No se encontraron archivos de métricas en el repositorio.**")
 
 if __name__ == "__main__":
     puerto = int(os.environ.get("PORT", 7860))
