@@ -20,14 +20,12 @@ import faiss
 from huggingface_hub import InferenceClient
 import gradio as gr
 
-# Verificar stopwords de NLTK
 for recurso_ruta, recurso_id in [("corpora/stopwords", "stopwords")]:
     try:
         nltk.data.find(recurso_ruta)
     except LookupError:
         nltk.download(recurso_id, quiet=True)
 
-# Rutas locales (deben estar en el mismo repo)
 RUTA_PARQUET_LOCAL = "corpus-00000-of-00001.parquet"
 RUTA_QUERIES_CACHE = "fiqa_queries.parquet"
 RUTA_QRELS_CACHE   = "fiqa_qrels_test.parquet"
@@ -40,6 +38,7 @@ MAX_DOCS = None
 MODELO_EMBEDDINGS = "all-MiniLM-L6-v2"
 TOP_K_EVAL = 10
 PROFUNDIDAD_AP = 100
+
 
 # ============================================================================
 # 1. CARGA DEL CORPUS, QUERIES Y QRELS
@@ -98,6 +97,8 @@ def cargar_fiqa_corpus(ruta_local=RUTA_PARQUET_LOCAL, max_docs=MAX_DOCS):
         c_str = str(cuerpo).strip() if pd.notna(cuerpo) else ""
         corpus_dict[doc_id_str] = f"{t_str} {c_str}".strip() if t_str else c_str
 
+    del df_corpus, ids_col, titulos_col, textos_col
+    gc.collect()
     return corpus_dict
 
 
@@ -124,6 +125,8 @@ def cargar_fiqa_queries_y_qrels(
             qrels_dict[q_str].add(d_str)
 
     queries_eval = {q_id: todas_queries[q_id] for q_id in qrels_dict.keys()}
+    del df_queries, df_qrels, todas_queries
+    gc.collect()
     return queries_eval, dict(qrels_dict)
 
 
@@ -139,7 +142,7 @@ def preprocesar_texto(texto: str):
 
 
 # ============================================================================
-# 2. ÍNDICE INVERTIDO PROPIO
+# 2. ÍNDICE INVERTIDO PROPIO (SIN DICCIONARIO INTERMEDIO DE TOKENS)
 # ============================================================================
 class IndiceInvertido:
     def __init__(self):
@@ -150,11 +153,12 @@ class IndiceInvertido:
         self.vocabulario = []
         self.total_postings = 0
 
-    def construir(self, docs_tokenizados: dict):
-        self.total_docs = len(docs_tokenizados)
+    def construir(self, corpus_textos: dict):
+        self.total_docs = len(corpus_textos)
         suma_longitudes = 0
 
-        for doc_id, tokens in docs_tokenizados.items():
+        for doc_id, texto in corpus_textos.items():
+            tokens = preprocesar_texto(texto)
             dl = len(tokens)
             self.longitudes_doc[doc_id] = dl
             suma_longitudes += dl
@@ -218,6 +222,8 @@ class ModelosClasicosRI:
             (np.array(valores, dtype=np.float32), (filas, columnas)),
             shape=(N, V),
         )
+        del filas, columnas, valores
+        gc.collect()
         self.normas_docs = np.sqrt(self.matriz_tfidf.multiply(self.matriz_tfidf).sum(axis=1)).A1
 
     def buscar_jaccard(self, consulta: str, top_k: int = 10):
@@ -336,7 +342,6 @@ class RecuperadorSemanticoFAISS:
 
     def indexar_o_cargar(self, corpus_dict: dict, ruta_indice: str = RUTA_FAISS_INDEX):
         self.doc_ids = list(corpus_dict.keys())
-        # IO_FLAG_MMAP lee el índice desde disco sin ocupar RAM extra
         self.index_faiss = faiss.read_index(ruta_indice, faiss.IO_FLAG_MMAP)
         print(f"Índice FAISS cargado (mmap): {self.index_faiss.ntotal:,} vectores.")
 
@@ -368,18 +373,15 @@ class RecuperadorSemanticoFAISS:
 # ============================================================================
 print("Iniciando carga del SRI FiQA-2018...")
 corpus = cargar_fiqa_corpus()
-doc_ids = list(corpus.keys())
-queries_test, qrels_test = cargar_fiqa_queries_y_qrels(set(doc_ids))
+queries_test, qrels_test = cargar_fiqa_queries_y_qrels(set(corpus.keys()))
 
-corpus_tokenizado = {doc_id: preprocesar_texto(texto) for doc_id, texto in corpus.items()}
 indice_invertido = IndiceInvertido()
-indice_invertido.construir(corpus_tokenizado)
-
-# Liberar tokens temporales para ahorrar ~120 MB de RAM
-del corpus_tokenizado
+indice_invertido.construir(corpus)
 gc.collect()
 
 motor_clasico = ModelosClasicosRI(indice_invertido)
+gc.collect()
+
 motor_semantico = RecuperadorSemanticoFAISS(MODELO_EMBEDDINGS)
 motor_semantico.indexar_o_cargar(corpus)
 gc.collect()
