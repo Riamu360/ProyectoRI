@@ -8,6 +8,12 @@ Aplicación principal en **Gradio** (`app.py`) y cuadernos experimentales en **J
 
 ---
 
+## Actualización
+
+Se agregó la versión final en blanco y negro del informe técnico, con cuatro páginas que describen el corpus, el diseño, los resultados de consulta y el análisis de métricas. [Abrir el informe técnico](Informe/Informe_Tecnico_Proyecto_SRI_FiQA2018_BN.pdf).
+
+---
+
 ## Descripción General
 
 El proyecto implementa un Sistema de Recuperación de Información (SRI) completo sobre el conjunto de datos **FiQA-2018** (*Financial Opinion Mining and Question Answering*, benchmark BeIR). La interfaz web (`app.py`) y el notebook principal (`Proyecto_1er_Bimestre_SRI_FiQA2018_v2.ipynb`) permiten:
