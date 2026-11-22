@@ -4,6 +4,7 @@ Aplicación principal en **Gradio** (`app.py`) y cuadernos experimentales en **J
 
 - **Despliegue activo en producción (Render):** [https://proyecto-1er-bimestre-sri-fiqa2018-v2.onrender.com](https://proyecto-1er-bimestre-sri-fiqa2018-v2.onrender.com)
 - **Repositorio:** `Riamu360/ProyectoRI` (rama `main`)
+- **Informe técnico:** [Informe_Tecnico_Proyecto_SRI_FiQA2018_BN.pdf](Informe/Informe_Tecnico_Proyecto_SRI_FiQA2018_BN.pdf)
 
 ---
 
