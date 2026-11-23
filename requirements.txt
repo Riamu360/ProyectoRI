@@ -2,9 +2,9 @@ pandas
 pyarrow
 numpy
 scipy
-nltk
-scikit-learn
 faiss-cpu
 matplotlib
 gradio
 huggingface_hub
+onnxruntime
+tokenizers
