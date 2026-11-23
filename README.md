@@ -12,6 +12,8 @@ Aplicación principal en **Gradio** (`app.py`) y cuadernos experimentales en **J
 
 Se agregó la versión final del informe técnico, con cuatro páginas que describen el corpus, el diseño, los resultados de consulta y el análisis de métricas. [Abrir el informe técnico](Informe/Informe_Tecnico_Proyecto_SRI_FiQA2018_BN.pdf).
 
+Se utilizó del servicio UpTimeRobot para que el URL del proyecto no tarde en desplegarse apenas se inicie después de unas horas, ya que este manda solicitudes cada 5 minutos y evita que se apague el servidor.
+
 ---
 
 ## Descripción General
