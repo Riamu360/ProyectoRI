@@ -93,7 +93,6 @@ Proyecto RI/
 │
 ├── Proyecto_1er_Bimestre_SRI_FiQA2018.ipynb                # Versión inicial del cuaderno experimental
 ├── Proyecto_1er_Bimestre_SRI_FiQA2018_v2.ipynb             # Cuaderno principal completo y documentado
-├── Proyecto_1er_Bimestre_SRI_FiQA2018_v2sin comentar.ipynb # Versión limpia del cuaderno v2
 │
 ├── corpus-00000-of-00001.parquet                           # Corpus completo FiQA-2018 (57,638 documentos)
 ├── fiqa_queries.parquet                                    # Consultas oficiales del benchmark FiQA-2018
