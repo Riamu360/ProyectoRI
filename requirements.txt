@@ -8,3 +8,4 @@ gradio
 huggingface_hub
 onnxruntime
 tokenizers
+nltk
