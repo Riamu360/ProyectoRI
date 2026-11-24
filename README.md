@@ -10,7 +10,7 @@ Aplicación principal en **Gradio** (`app.py`) y cuadernos experimentales en **J
 
 ## Actualización
 
-Se agregó la versión final en blanco y negro del informe técnico, con cuatro páginas que describen el corpus, el diseño, los resultados de consulta y el análisis de métricas. [Abrir el informe técnico](Informe/Informe_Tecnico_Proyecto_SRI_FiQA2018_BN.pdf).
+Se agregó la versión final en blanco y negro del informe técnico, con cinco páginas sobre el corpus, el diseño, los resultados, las métricas y el diagrama de arquitectura. [Abrir el informe técnico](Informe/Informe_Tecnico_Proyecto_SRI_FiQA2018_BN.pdf).
 
 ---
 
