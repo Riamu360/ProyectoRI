@@ -12,6 +12,8 @@ Aplicación principal en **Gradio** (`app.py`) y cuadernos experimentales en **J
 
 Se agregó la versión final en blanco y negro del informe técnico, con cinco páginas sobre el corpus, el diseño, los resultados, las métricas y el diagrama de arquitectura. [Abrir el informe técnico](Informe/Informe_Tecnico_Proyecto_SRI_FiQA2018_BN.pdf).
 
+Se configuró UptimeRobot para enviar una solicitud cada cinco minutos y mantener activa la instancia gratuita del servicio.
+
 ---
 
 ## Descripción General
@@ -91,7 +93,6 @@ Proyecto RI/
 │
 ├── Proyecto_1er_Bimestre_SRI_FiQA2018.ipynb                # Versión inicial del cuaderno experimental
 ├── Proyecto_1er_Bimestre_SRI_FiQA2018_v2.ipynb             # Cuaderno principal completo y documentado
-├── Proyecto_1er_Bimestre_SRI_FiQA2018_v2sin comentar.ipynb # Versión limpia del cuaderno v2
 │
 ├── corpus-00000-of-00001.parquet                           # Corpus completo FiQA-2018 (57,638 documentos)
 ├── fiqa_queries.parquet                                    # Consultas oficiales del benchmark FiQA-2018
