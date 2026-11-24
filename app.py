@@ -1,23 +1,26 @@
 import os
-import re
 import gc
 import math
-import platform
 from collections import defaultdict, Counter
 
 import numpy as np
 import pandas as pd
-import pyarrow as pa
-import pyarrow.parquet as pq
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from scipy.sparse import csr_matrix
+import nltk
+from nltk.corpus import stopwords
+from nltk.tokenize import RegexpTokenizer
 import faiss
-import onnxruntime as ort
-from tokenizers import Tokenizer
-from huggingface_hub import HfApi, hf_hub_download
+from huggingface_hub import InferenceClient
 import gradio as gr
+
+for recurso_ruta, recurso_id in [("corpora/stopwords", "stopwords")]:
+    try:
+        nltk.data.find(recurso_ruta)
+    except LookupError:
+        nltk.download(recurso_id, quiet=True)
 
 RUTA_PARQUET_LOCAL = "corpus-00000-of-00001.parquet"
 RUTA_QUERIES_CACHE = "fiqa_queries.parquet"
@@ -29,37 +32,13 @@ RUTA_EVAL_DETALLE  = "fiqa_eval_detalle.parquet"
 # Muestra de 12,000 documentos para Render Free (512 MB RAM)
 MAX_DOCS = 12000
 MODELO_EMBEDDINGS = "all-MiniLM-L6-v2"
-MAX_SEQ_LEN = 256
 TOP_K_EVAL = 10
 PROFUNDIDAD_AP = 100
 
 
-def _leer_dataframe_acotado(ruta_local: str, max_docs: int = None) -> pd.DataFrame:
-    """Lee solo las primeras max_docs filas cuando el archivo es Parquet para evitar picos de RAM."""
-    lower = ruta_local.lower()
-    if lower.endswith(".parquet"):
-        if max_docs is None:
-            return pd.read_parquet(ruta_local)
-        pf = pq.ParquetFile(ruta_local)
-        tablas = []
-        acumulado = 0
-        for batch in pf.iter_batches(batch_size=max_docs):
-            tablas.append(pa.Table.from_batches([batch]))
-            acumulado += batch.num_rows
-            if acumulado >= max_docs:
-                break
-        if not tablas:
-            return pd.DataFrame()
-        return pa.concat_tables(tablas).to_pandas().head(max_docs)
+def _descargar_tabla_hf(repo_id: str, palabras_clave: list):
+    from huggingface_hub import HfApi, hf_hub_download
 
-    if lower.endswith((".jsonl", ".jsonl.gz")):
-        df = pd.read_json(ruta_local, lines=True)
-    else:
-        df = pd.read_csv(ruta_local, sep="\t")
-    return df.head(max_docs) if max_docs is not None else df
-
-
-def _descargar_tabla_hf(repo_id: str, palabras_clave: list, max_docs: int = None) -> pd.DataFrame:
     api = HfApi()
     for revision in ["refs/convert/parquet", "main"]:
         try:
@@ -80,17 +59,24 @@ def _descargar_tabla_hf(repo_id: str, palabras_clave: list, max_docs: int = None
                 repo_type="dataset",
                 revision=revision,
             )
-            return _leer_dataframe_acotado(ruta_local, max_docs=max_docs)
+            if candidatos[0].endswith(".parquet"):
+                return pd.read_parquet(ruta_local)
+            if candidatos[0].endswith((".jsonl", ".jsonl.gz")):
+                return pd.read_json(ruta_local, lines=True)
+            return pd.read_csv(ruta_local, sep="\t")
 
     raise FileNotFoundError(f"No se encontraron archivos ({palabras_clave}) en '{repo_id}'.")
 
 
 def cargar_fiqa_corpus(ruta_local=RUTA_PARQUET_LOCAL, max_docs=MAX_DOCS):
     if os.path.exists(ruta_local):
-        df_corpus = _leer_dataframe_acotado(ruta_local, max_docs=max_docs)
+        df_corpus = pd.read_parquet(ruta_local)
     else:
         print("Descargando muestra del corpus FiQA-2018 desde Hugging Face...")
-        df_corpus = _descargar_tabla_hf("BeIR/fiqa", ["corpus"], max_docs=max_docs)
+        df_corpus = _descargar_tabla_hf("BeIR/fiqa", ["corpus"])
+
+    if max_docs is not None:
+        df_corpus = df_corpus.head(max_docs)
 
     corpus_dict = {}
     ids_col = df_corpus["_id"].tolist()
@@ -128,38 +114,14 @@ def cargar_fiqa_queries_y_qrels(corpus_ids_validos: set):
     return queries_eval, dict(qrels_dict)
 
 
-# Lista exacta de 198 stopwords en inglés de NLTK (evita importar nltk y ahorra ~93 MB de RAM)
-STOPWORDS_EN = frozenset({
-    "a", "about", "above", "after", "again", "against", "ain", "all", "am", "an",
-    "and", "any", "are", "aren", "aren't", "as", "at", "be", "because", "been",
-    "before", "being", "below", "between", "both", "but", "by", "can", "couldn",
-    "couldn't", "d", "did", "didn", "didn't", "do", "does", "doesn", "doesn't",
-    "doing", "don", "don't", "down", "during", "each", "few", "for", "from",
-    "further", "had", "hadn", "hadn't", "has", "hasn", "hasn't", "have", "haven",
-    "haven't", "having", "he", "he'd", "he'll", "he's", "her", "here", "hers",
-    "herself", "him", "himself", "his", "how", "i", "i'd", "i'll", "i'm", "i've",
-    "if", "in", "into", "is", "isn", "isn't", "it", "it'd", "it'll", "it's", "its",
-    "itself", "just", "ll", "m", "ma", "me", "mightn", "mightn't", "more", "most",
-    "mustn", "mustn't", "my", "myself", "needn", "needn't", "no", "nor", "not",
-    "now", "o", "of", "off", "on", "once", "only", "or", "other", "our", "ours",
-    "ourselves", "out", "over", "own", "re", "s", "same", "shan", "shan't", "she",
-    "she'd", "she'll", "she's", "should", "should've", "shouldn", "shouldn't",
-    "so", "some", "such", "t", "than", "that", "that'll", "the", "their", "theirs",
-    "them", "themselves", "then", "there", "these", "they", "they'd", "they'll",
-    "they're", "they've", "this", "those", "through", "to", "too", "under",
-    "until", "up", "ve", "very", "was", "wasn", "wasn't", "we", "we'd", "we'll",
-    "we're", "we've", "were", "weren", "weren't", "what", "when", "where", "which",
-    "while", "who", "whom", "why", "will", "with", "won", "won't", "wouldn",
-    "wouldn't", "y", "you", "you'd", "you'll", "you're", "you've", "your", "yours",
-    "yourself", "yourselves",
-})
-TOKENIZADOR_RE = re.compile(r"[a-z0-9]+")
+STOPWORDS_EN = frozenset(stopwords.words("english"))
+TOKENIZADOR_NLTK = RegexpTokenizer(r"[a-z0-9]+")
 
 
 def preprocesar_texto(texto: str):
     if not texto:
         return []
-    tokens = TOKENIZADOR_RE.findall(texto.lower())
+    tokens = TOKENIZADOR_NLTK.tokenize(texto.lower())
     return [t for t in tokens if len(t) > 1 and t not in STOPWORDS_EN]
 
 
@@ -291,87 +253,46 @@ class ModelosClasicosRI:
 
 
 class RecuperadorSemanticoFAISS:
-    """Codifica consultas localmente con ONNX Runtime (sin PyTorch ni HF_TOKEN) y busca en FAISS."""
-
     def __init__(self, doc_ids_muestra: list):
+        self.client = InferenceClient(model=f"sentence-transformers/{MODELO_EMBEDDINGS}", token=os.environ.get("HF_TOKEN"))
         self.doc_ids = doc_ids_muestra
         self.index_faiss = faiss.read_index(RUTA_FAISS_INDEX, faiss.IO_FLAG_MMAP)
-        self.ultimo_error = ""
-
-        repo_modelo = f"sentence-transformers/{MODELO_EMBEDDINGS}"
-        ruta_tok = hf_hub_download(repo_id=repo_modelo, filename="tokenizer.json")
-        self.tokenizer = Tokenizer.from_file(ruta_tok)
-        self.tokenizer.enable_truncation(max_length=MAX_SEQ_LEN)
-
-        self.session = self._cargar_sesion_onnx(repo_modelo)
-        self._nombres_entrada = {inp.name for inp in self.session.get_inputs()}
-
-    @staticmethod
-    def _cargar_sesion_onnx(repo_modelo: str) -> ort.InferenceSession:
-        arch = platform.machine().lower()
-        if "arm" in arch or "aarch64" in arch:
-            candidatos = ["onnx/model_qint8_arm64.onnx", "onnx/model.onnx"]
-        else:
-            candidatos = ["onnx/model_quint8_avx2.onnx", "onnx/model.onnx"]
-
-        opts = ort.SessionOptions()
-        opts.intra_op_num_threads = 1
-        opts.inter_op_num_threads = 1
-
-        ultimo_exc = None
-        for nombre_onnx in candidatos:
-            try:
-                ruta_onnx = hf_hub_download(repo_id=repo_modelo, filename=nombre_onnx)
-                return ort.InferenceSession(ruta_onnx, sess_options=opts, providers=["CPUExecutionProvider"])
-            except Exception as exc:
-                ultimo_exc = exc
-        raise RuntimeError(f"No se pudo inicializar la sesión ONNX para '{repo_modelo}': {ultimo_exc}")
-
-    def _codificar_consulta(self, consulta: str) -> np.ndarray:
-        enc = self.tokenizer.encode(consulta)
-        input_ids = np.array([enc.ids], dtype=np.int64)
-        attention_mask = np.array([enc.attention_mask], dtype=np.int64)
-
-        feed = {"input_ids": input_ids, "attention_mask": attention_mask}
-        if "token_type_ids" in self._nombres_entrada:
-            feed["token_type_ids"] = np.array([enc.type_ids], dtype=np.int64)
-
-        token_embeddings = self.session.run(None, feed)[0]
-        mask_f32 = attention_mask[:, :, None].astype(np.float32)
-        pooled = (token_embeddings * mask_f32).sum(axis=1) / np.clip(mask_f32.sum(axis=1), 1e-9, None)
-        emb_q = pooled.astype("float32")
-        faiss.normalize_L2(emb_q)
-        return emb_q
 
     def buscar(self, consulta: str, top_k: int = 10):
-        self.ultimo_error = ""
         if top_k <= 0 or not consulta or not consulta.strip():
             return []
         try:
-            emb_q = self._codificar_consulta(consulta)
-            n_muestra = len(self.doc_ids)
-            if n_muestra == 0:
-                return []
+            emb_q = np.array(self.client.feature_extraction(consulta), dtype="float32")
+            if emb_q.ndim == 1:
+                emb_q = emb_q.reshape(1, -1)
+            elif emb_q.ndim == 3:
+                emb_q = emb_q.mean(axis=1)
+            faiss.normalize_L2(emb_q)
 
-            k = min(top_k, n_muestra)
-            if n_muestra < self.index_faiss.ntotal:
-                params = faiss.SearchParameters(sel=faiss.IDSelectorRange(0, n_muestra))
-                distancias, indices = self.index_faiss.search(emb_q, k, params=params)
-            else:
-                distancias, indices = self.index_faiss.search(emb_q, k)
-
+            k_busqueda = min(max(top_k * 8, 80), self.index_faiss.ntotal)
+            distancias, indices = self.index_faiss.search(emb_q, k_busqueda)
             resultados = []
+            n_muestra = len(self.doc_ids)
             for score, idx in zip(distancias[0], indices[0]):
                 if 0 <= idx < n_muestra and score > 0:
                     resultados.append((self.doc_ids[idx], round(float(score), 4)))
+                    if len(resultados) >= top_k:
+                        break
             return resultados
         except Exception as e:
-            self.ultimo_error = str(e)
-            print(f"Error búsqueda semántica ONNX/FAISS: {e}")
+            print(f"Error API embeddings: {e}")
             return []
 
 
-# Carga directa y ligera de la muestra (12,000 docs)
+def preparar_detalle_muestra(df_detalle: pd.DataFrame, n_filas: int = 100) -> pd.DataFrame:
+    if df_detalle.empty:
+        return df_detalle
+    cols_orden = [c for c in ["Query ID", "Modelo"] if c in df_detalle.columns]
+    if len(cols_orden) == 2:
+        return df_detalle.sort_values(cols_orden).head(n_filas)
+    return df_detalle.head(n_filas)
+
+
 print("Cargando muestra de FiQA-2018...")
 corpus = cargar_fiqa_corpus()
 doc_ids = list(corpus.keys())
@@ -426,19 +347,14 @@ def ejecutar_busqueda_web(consulta: str, modelo_elegido: str, top_n: int):
     top_n = int(top_n)
     q_id_match, relevantes = _buscar_qrels_por_texto(consulta)
 
-    res_jaccard = motor_clasico.buscar_jaccard(consulta, top_k=top_n)
-    res_tfidf = motor_clasico.buscar_tfidf_coseno(consulta, top_k=top_n)
-    res_bm25 = motor_clasico.buscar_bm25(consulta, top_k=top_n)
-    res_faiss = motor_semantico.buscar(consulta, top_k=top_n)
-
     if modelo_elegido == "Binario (Jaccard)":
-        res_sel = res_jaccard
+        res_sel = motor_clasico.buscar_jaccard(consulta, top_k=top_n)
     elif modelo_elegido == "Vectorial (TF-IDF + Coseno)":
-        res_sel = res_tfidf
+        res_sel = motor_clasico.buscar_tfidf_coseno(consulta, top_k=top_n)
     elif modelo_elegido == "Probabilístico (BM25)":
-        res_sel = res_bm25
+        res_sel = motor_clasico.buscar_bm25(consulta, top_k=top_n)
     else:
-        res_sel = res_faiss
+        res_sel = motor_semantico.buscar(consulta, top_k=top_n)
 
     filas_ind = [
         {
@@ -464,23 +380,22 @@ def ejecutar_busqueda_web(consulta: str, modelo_elegido: str, top_n: int):
 
     df_comp = pd.DataFrame({
         "Rank": [i + 1 for i in range(top_n)],
-        "Jaccard (Binario)": fmt_celdas(res_jaccard),
-        "TF-IDF (Coseno)": fmt_celdas(res_tfidf),
-        "BM25 (Probabilístico)": fmt_celdas(res_bm25),
-        "Embeddings (FAISS)": fmt_celdas(res_faiss),
+        "Jaccard (Binario)": fmt_celdas(motor_clasico.buscar_jaccard(consulta, top_k=top_n)),
+        "TF-IDF (Coseno)": fmt_celdas(motor_clasico.buscar_tfidf_coseno(consulta, top_k=top_n)),
+        "BM25 (Probabilístico)": fmt_celdas(motor_clasico.buscar_bm25(consulta, top_k=top_n)),
+        "Embeddings (FAISS)": fmt_celdas(motor_semantico.buscar(consulta, top_k=top_n)),
     })
 
     estado = (
         f"Consulta detectada en Test Set (`query_id={q_id_match}`, {len(relevantes)} relevantes en qrels)."
         if q_id_match else f"Consulta libre ejecutada sobre muestra de {len(corpus):,} documentos."
     )
-    if motor_semantico.ultimo_error:
-        estado += f" | Aviso Embeddings: {motor_semantico.ultimo_error}"
     return df_individual, df_comp, estado
 
 
 df_resumen_ui = pd.read_csv(RUTA_EVAL_RESUMEN) if os.path.exists(RUTA_EVAL_RESUMEN) else pd.DataFrame()
 df_detalle_ui = pd.read_parquet(RUTA_EVAL_DETALLE) if os.path.exists(RUTA_EVAL_DETALLE) else pd.DataFrame()
+df_detalle_vista = preparar_detalle_muestra(df_detalle_ui, n_filas=100)
 n_eval_ui = int(df_resumen_ui["Consultas Evaluadas"].iloc[0]) if not df_resumen_ui.empty else 0
 
 ejemplos_ui = [
@@ -488,9 +403,6 @@ ejemplos_ui = [
     ["How can I improve my credit score quickly without paying fees?"],
     ["What is the difference between an index fund and an ETF?"],
 ]
-if queries_test:
-    primeras_test = [[q] for q in list(queries_test.values())[:3]]
-    ejemplos_ui = primeras_test + ejemplos_ui[:1]
 
 with gr.Blocks(title="SRI FiQA-2018 — Proyecto 1er Bimestre") as demo:
     gr.Markdown("# Sistema de Recuperación de Información — Corpus FiQA-2018 (BeIR)")
@@ -519,9 +431,8 @@ with gr.Blocks(title="SRI FiQA-2018 — Proyecto 1er Bimestre") as demo:
             gr.Dataframe(value=df_resumen_ui, interactive=False)
             gr.Plot(value=graficar_metricas_modelos(df_resumen_ui), label="Gráfico Comparativo")
             gr.Markdown("### Desglose por Consulta (Muestra de 100 filas)")
-            gr.Dataframe(value=df_detalle_ui.head(100), interactive=False)
+            gr.Dataframe(value=df_detalle_vista, interactive=False)
 
 if __name__ == "__main__":
     puerto = int(os.environ.get("PORT", 7860))
-    compartir = os.environ.get("GRADIO_SHARE", "").lower() == "true"
-    demo.launch(server_name="0.0.0.0", server_port=puerto, share=compartir)
+    demo.launch(server_name="0.0.0.0", server_port=puerto, share=False)
