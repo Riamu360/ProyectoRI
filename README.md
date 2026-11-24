@@ -10,7 +10,7 @@ Aplicación principal en **Gradio** (`app.py`) y cuadernos experimentales en **J
 
 ## Actualización
 
-Se agregó la versión final en blanco y negro del informe técnico, con cinco páginas sobre el corpus, el diseño, los resultados, las métricas y el diagrama de arquitectura. [Abrir el informe técnico](Informe/Informe_Tecnico_Proyecto_SRI_FiQA2018_BN.pdf).
+Se actualizó el informe técnico a la versión vigente de App v2. Incluye cinco páginas con el corpus, el diseño, los resultados, las métricas y un diagrama de arquitectura que refleja la generación local de embeddings con ONNX Runtime. [Abrir el informe técnico](Informe/Informe_Tecnico_Proyecto_SRI_FiQA2018_BN.pdf).
 
 Se configuró UptimeRobot para enviar una solicitud cada cinco minutos y mantener activa la instancia gratuita del servicio.
 
